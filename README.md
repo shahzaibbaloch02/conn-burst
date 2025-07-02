@@ -58,4 +58,3 @@ Authors
 -------
 
  - Seth Hall <seth@corelight.com>
-# conn-burst

@@ -1,126 +1,123 @@
-##! Identifies connections that are bursting (lots of data and transferring quickly)
+##! Detect "bursting connections".
+
+@load base/protocols/conn
 
 module ConnBurst;
 
 export {
-    ## The speed threshold in Mbps to consider a connection "bursty"
-    const speed_threshold = 50.0 &redef;
-    
-    ## The size threshold in MB that must be transferred before checking speed
-    const size_threshold = 100.0 &redef;
-    
-    ## Event generated when a bursting connection is detected
-    global detected: event(c: connection, rate_in_mbps: double);
-    
-    ## Log record for connection bursts
-    type Info: record {
-        ## Timestamp when the burst was detected
-        ts: time &log;
-        ## Connection UID
-        uid: string &log;
-        ## Source address
-        orig_h: addr &log;
-        ## Source port
-        orig_p: port &log;
-        ## Destination address
-        resp_h: addr &log;
-        ## Destination port
-        resp_p: port &log;
-        ## Protocol
-        proto: transport_proto &log;
-        ## Data rate in Mbps
-        rate_mbps: double &log;
-        ## Total bytes transferred
-        total_bytes: count &log;
-        ## Duration of the connection when burst detected
-        duration: interval &log;
-    };
-    
-    ## Log stream for connection bursts
-    redef enum Log::ID += { LOG };
+    ## The speed of a connection that is defined as "too fast" and
+    ## leads to the `ConnBurst::detected` event being generated.
+    ## Defined in Mbps (Megabits per second).
+    const speed_threshold: double = 50.0 &redef;
+
+    ## The threshold of data that must be transferred before connection
+    ## polling to measure speed is started. Defined in MB (megabytes).
+    const size_threshold: count = 100 &redef;
+
+    ## An event to indicate that a big and fast connection (bursty 
+    ## connection) was detected.
+    global event detected(c: connection, rate_in_mbps: double);
 }
 
-# Track connections we've already identified as bursty
-global bursty_conns: set[string] = set();
+# Duration between polls of conn size after the ConnSize analyzer 
+# has triggered. You probably don't need to configure this.
+const poll_interval = 100msecs &redef;
 
-event zeek_init() &priority=5 {
-    Log::create_stream(ConnBurst::LOG, [$columns=Info, $path="conn_burst"]);
+# This indicates how many times the speed will be checked after the size
+# limit is hit. You probably don't need to configure this.
+const number_of_speed_polls = 1 &redef;
+
+# Only used internally so we don't need to keep doing the math.
+global size_threshold_in_bytes: count = 0;
+
+redef record connection += {
+    clburst_last_Mb: count &default=0;
+    clburst_last_ts: time &optional;
+    clburst_hit: bool &default=F;
+};
+
+event zeek_init()
+{
+    size_threshold_in_bytes = size_threshold * 1024 * 1024;
 }
 
-event connection_state_remove(c: connection) {
-    # Clean up tracking
-    if ( c$uid in bursty_conns )
-        delete bursty_conns[c$uid];
+function speed_during_last_poll(c: connection): double
+{
+    if ( ! c?$clburst_last_ts )
+        c$clburst_last_ts = c$start_time;
+
+    local Mb = (((c$orig$size + c$resp$size) * 8) / 1024 / 1024);
+    local Mb_delta = Mb - c$clburst_last_Mb;
+
+    local ts = network_time();
+    local time_delta = interval_to_double(ts - c$clburst_last_ts);
+
+    local Mbps = 0.0;
+    if ( time_delta > 0 )
+        Mbps = Mb_delta / time_delta;
+
+    c$clburst_last_Mb = Mb;
+    c$clburst_last_ts = ts;
+    return Mbps;
 }
 
-event new_connection(c: connection) {
-    # Initialize tracking for this connection
-    if ( ! c?$conn )
-        return;
-}
+function size_callback(c: connection, cnt: count): interval
+{
+    if ( c$clburst_hit )
+        return -1sec;
 
-# Check for bursting connections periodically
-event ConnBurst::check_connection(c: connection) {
-    if ( ! c?$conn )
-        return;
-        
-    # Skip if we already identified this connection as bursty
-    if ( c$uid in bursty_conns )
-        return;
-        
-    local conn = c$conn;
-    local total_bytes = conn$orig_bytes + conn$resp_bytes;
-    
-    # Convert bytes to MB
-    local total_mb = double_to_count(total_bytes) / 1048576.0;
-    
-    # Only check connections that have transferred enough data
-    if ( total_mb < size_threshold )
-        return;
-        
-    # Calculate duration
-    local duration = network_time() - conn$ts;
-    if ( duration <= 0.0 )
-        return;
-        
-    # Calculate rate in Mbps (megabits per second)
-    local rate_mbps = (total_mb * 8.0) / interval_to_double(duration);
-    
-    # Check if this connection is bursty
-    if ( rate_mbps >= speed_threshold ) {
-        # Mark this connection as bursty so we don't check it again
-        add bursty_conns[c$uid];
-        
-        # Generate the event
-        event ConnBurst::detected(c, rate_mbps);
-        
-        # Log the burst
-        local rec: ConnBurst::Info = [
-            $ts = network_time(),
-            $uid = c$uid,
-            $orig_h = c$id$orig_h,
-            $orig_p = c$id$orig_p,
-            $resp_h = c$id$resp_h,
-            $resp_p = c$id$resp_p,
-            $proto = get_port_transport_proto(c$id$orig_p),
-            $rate_mbps = rate_mbps,
-            $total_bytes = total_bytes,
-            $duration = duration
-        ];
-        
-        Log::write(ConnBurst::LOG, rec);
+    if ( cnt < number_of_speed_polls )
+    {
+        local speed = speed_during_last_poll(c);
+        if ( speed > speed_threshold )
+        {
+            event ConnBurst::detected(c, speed);
+            c$clburst_hit = T;
+
+            # stop polling after this was detected.
+            return -1sec;
+        }
+
+        return poll_interval;
+    }
+    else
+    {
+        # Set conn thresholds for the next jump up.
+        local next_orig_multiplier = double_to_count(floor(c$orig$size / size_threshold_in_bytes));
+        if ( next_orig_multiplier > 0 )
+        {
+            # Later byte threshold checks are less often than the initial one
+            ConnThreshold::set_bytes_threshold(c, (next_orig_multiplier+3) * size_threshold_in_bytes, T);
+        }
+
+        local next_resp_multiplier = double_to_count(floor(c$resp$size / size_threshold_in_bytes));
+        if ( next_resp_multiplier > 0 )
+        {
+            # Later byte threshold checks are less often than the initial one
+            ConnThreshold::set_bytes_threshold(c, (next_resp_multiplier+3) * size_threshold_in_bytes, F);
+        }
+
+        # end this polling
+        return -1sec;
     }
 }
 
-# Schedule periodic checks for active connections
-event new_connection(c: connection) &priority=-5 {
-    schedule 1.0 sec { ConnBurst::check_connection(c) };
+event new_connection(c: connection)
+{
+    # This deals with the fact that icmp connections can't be looked up and maybe 
+    # some other situations too?
+    if ( connection_exists(c$id) )
+    {
+        ConnThreshold::set_bytes_threshold(c, size_threshold_in_bytes, T);
+        ConnThreshold::set_bytes_threshold(c, size_threshold_in_bytes, F);
+    }
 }
 
-# Continue checking connections that aren't bursty yet
-event ConnBurst::check_connection(c: connection) &priority=-5 {
-    if ( c$uid !in bursty_conns && c?$conn ) {
-        # Schedule another check in 1 second
-        schedule 1.0 sec { ConnBurst::check_connection(c) };
+event conn_bytes_threshold_crossed(c: connection, threshold: count, is_orig: bool)
+{
+    # Make sure this is one of our callbacks
+    if ( threshold % size_threshold == 0 )
+    {
+        ConnPolling::watch(c, size_callback, 0, poll_interval);
     }
 }

@@ -1,7 +1,6 @@
 ##! Detect "bursting connections".
 
 @load base/protocols/conn
-@load policy/misc/conn-burst-analyzer
 @load ./log.zeek
 
 module ConnBurst;

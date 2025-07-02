@@ -1,17 +1,19 @@
 ##! Detect "bursting connections".
 
 @load base/protocols/conn
+@load policy/misc/conn-burst-analyzer
+@load ./log.zeek
 
 module ConnBurst;
 
 export {
 	## The speed of a connection that is defined as "too fast" and
-	## leads to the :bro:see:`ConnBurst::detected` event being
-	## generated.  Defined in Mbps (Megabits per second).
+	## leads to the :zeek:see:`ConnBurst::detected` event being
+	## generated. Defined in Mbps (Megabits per second).
 	const speed_threshold: double = 50.0 &redef;
 
 	## The threshold of data that must be transferred before connection
-	## polling to measure speed is started.  Defined in MB (megabytes).
+	## polling to measure speed is started. Defined in MB (megabytes).
 	const size_threshold: count = 100 &redef;
 
 	## An event to indicate that a big and fast connection (bursty 
@@ -20,14 +22,14 @@ export {
 }
 
 # Duration between polls of conn size after the ConnSize analyzer 
-# has triggered.  You probably don't need to configure this.
+# has triggered.
 const poll_interval = 100msecs &redef;
 
 # This indicates how many times the speed will be checked after the size
-# limit is hit.  You probably don't need to configure this.
+# limit is hit.
 const number_of_speed_polls = 1 &redef;
 
-# Only used internally so we don't need to keep doing the math.
+# Internal use only
 global size_threshold_in_bytes = 0;
 
 redef record connection += {
@@ -74,7 +76,7 @@ function size_callback(c: connection, cnt: count): interval
 			event ConnBurst::detected(c, speed);
 			c$clburst_hit = T;
 
-			# stop polling after this was detected.
+			# stop polling after detection
 			return -1sec;
 			}
 
@@ -82,30 +84,21 @@ function size_callback(c: connection, cnt: count): interval
 		}
 	else
 		{
-		# Set conn thresholds for the next jump up.
+		# Next thresholds
 		local next_orig_multiplier = double_to_count(floor(c$orig$size / size_threshold_in_bytes));
 		if ( next_orig_multiplier > 0 )
-			{
-			# Later byte threshold checks are less often than the initial one
 			ConnThreshold::set_bytes_threshold(c, (next_orig_multiplier+3) * size_threshold_in_bytes, T);
-			}
 
 		local next_resp_multiplier = double_to_count(floor(c$resp$size / size_threshold_in_bytes));
 		if ( next_resp_multiplier > 0 )
-			{
-			# Later byte threshold checks are less often than the initial one
 			ConnThreshold::set_bytes_threshold(c, (next_resp_multiplier+3) * size_threshold_in_bytes, F);
-			}
 
-		# end this polling
 		return -1sec;
 		}
 	}
 
 event new_connection(c: connection)
 	{
-	# This deals with the fact that icmp connections can't be looked up and maybe 
-	# some other situations too?
 	if ( connection_exists(c$id) )
 		{
 		ConnThreshold::set_bytes_threshold(c, size_threshold_in_bytes, T);
@@ -115,10 +108,6 @@ event new_connection(c: connection)
 
 event conn_bytes_threshold_crossed(c: connection, threshold: count, is_orig: bool)
 	{
-	# Make sure this is one of our callbacks
-	if ( threshold % size_threshold == 0 )
-		{
+	if ( threshold % size_threshold_in_bytes == 0 )
 		ConnPolling::watch(c, size_callback, 0, poll_interval);
-		}
 	}
-

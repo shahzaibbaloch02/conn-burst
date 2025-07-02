@@ -16,7 +16,7 @@ export {
 
     ## An event to indicate that a big and fast connection (bursty 
     ## connection) was detected.
-    event detected(c: connection, rate_in_mbps: double);
+    event detected(c: connection, rate_in_mbps: double)
 }
 
 # Duration between polls of conn size after the ConnSize analyzer 

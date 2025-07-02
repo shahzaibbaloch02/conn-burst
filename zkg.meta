@@ -1,4 +1,11 @@
 [package]
-description = Identify bursty connections (large and fast)
-tags = conn, burst
-script_dir = scripts
+description = Identifies connections that are bursting (lots of data and transferring quickly)
+tags = conn, analysis, performance
+plugin_dir = scripts
+version = 1.1.0
+
+[prereq]
+zeek_version = >=4.0.0
+
+[bundle]
+makefile = Makefile
